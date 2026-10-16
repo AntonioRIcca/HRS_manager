@@ -1,3 +1,5 @@
+import datetime
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,15 +14,19 @@ dt = 0.25  # Intervalli di 15 minuti in ore
 # Parametri di sistema
 pv_peak = 15.0
 grid_limit = 9.0
+pod_en = 0.0
+load_en = 0.0
+pv_en = 0.0
 
 bess_cap = 24.0
 bess_p_max = 25.0
-initial_bess_soc = 0.5 * bess_cap  # 12 kWh (50% - Target fine/inizio giornata)
+initial_bess_soc = 0.0  # (50% - Target fine/inizio giornata)
 bess_soc = initial_bess_soc
+bess_en = 0.0
 
 h2_store_cap = 1500
 h2_store_flow_max = 4000  # g/h = 83.33 g/min
-initial_h2_mass = 1500  # g (100% - Target fine/inizio giornata)
+initial_h2_mass = h2_store_cap * 0.0  # g (100% - Target fine/inizio giornata)
 h2_store_mass = initial_h2_mass
 h2_store_flow = 0.0     # FLusso istantaneo
 
@@ -28,6 +34,7 @@ el_p_max = 9.0  # Potenza massima nominale EL = 9 kW
 el_eff = 22.0   # g/kWh (22 g/kW)
 h2_flow_EL = 0.0
 h2_flow_av_EL = el_p_max * el_eff  # Caso in cui non ho limiti sull'elettrolizzatore
+el_en = 0.0
 
 # Flotta veicoli inizialmente completamente scarichi (SOC = 0.0)
 vehicles = []
@@ -36,7 +43,7 @@ for i in range(5):
         'id': f'CargoBike_{i + 1}',
         'cap': 100,  # g
         'rate': 500,  #  g/h = 8.33 g/min
-        'soc': 0.0,
+        'soc': 1.0,
         'flow': 0.0,
         'start_time': None,
         'end_time': None,
@@ -47,7 +54,7 @@ for i in range(2):
         'id': f'Forklift_{i + 1}',
         'cap': 1800.0,  # g
         'rate': 3000.0,  # g/h = 50.0 g/min
-        'soc': 0.0,
+        'soc': 1.0,
         'flow': 0.0,
         'start_time': None,
         'end_time': None,
@@ -68,17 +75,20 @@ step_init = {
     'Grid_Power_kW': 0.0,
     'BESS_Power_kW': 0.0,
     'Electrolyzer_Power_kW': 0.0,
-    'BESS_SOC_kWh': bess_soc,
-    'BESS_SOC_Percent': (bess_soc / bess_cap) * 100.0,
+    'BESS_SOC_kWh': bess_soc * bess_cap,
+    'BESS_SOC_Percent': bess_soc * 100.0,
     'H2_Storage_kg': h2_store_mass,
     'H2_Storage_Percent': (h2_store_mass / h2_store_cap) * 100.0,
     'H2_Produced_kg': 0.0,
-    'H2_Dispensed_Total_kg': 0.0
+    'H2_Dispensed_Total_kg': 0.0,
+    'H2_flow_EL': 0.0,
+    'H2_flow_H2S': 0.0,
+    'H2_flow_H2V': 0.0,
 }
 for v in vehicles:
     step_init[f"{v['id']}_SOC_kg"] = v['soc']
     step_init[f"{v['id']}_SOC_Percent"] = (v['soc'] / v['cap']) * 100.0
-    v['soc_history'] = [(v['soc'] / v['cap']) * 100.0]
+    v['soc_history'] = [100]
 
 results.append(step_init)
 
@@ -114,47 +124,114 @@ for idx, row in df.iloc[1:].iterrows():
 
     h2_dispensed_step = 0.0     # Todo: To delete
 
-
+    h2_store_flow = 0.0
+    h2_flow_EL = 0.0
+    h2_flow_H2V = 0.0
 
     h2_flow_av_EL = el_p_max * el_eff  # Caso in cui non ho limiti sull'elettrolizzatore
     # h2_flow_av_EL = min(el_p_max, pv_gen) * el_eff   # Caso in cui produco solo da PV
 
     h2_flow_av_store = min(h2_store_mass / dt, (h2_store_flow_max - h2_store_flow))
 
+
     # IMPORTANTE: Codice aggiunto da AR
     for v in vehicles:
         h2_flow_demand = 0.0     # Richiesta totale di H2 da parte dei veicoli
 
+        # TODO: l'orario deve essere generalizzato
+        # Politica di ricarica
+        if ora_val <= datetime.time(7, 0) or ora_val >= datetime.time(18, 0):
+            if v['soc'] < 1:
+                # La portata massima dipende da quanto H2 posso inserire in ogni veicolo, dalla portata massima del veicolo
+                # e da quanto può erogare sia l'H2S che l'EL
+                h2_flow_v_max = min((1 - v['soc']) * v['cap'] / dt,
+                                    v['rate'],
+                                    h2_flow_av_store + h2_flow_av_EL)
+                # print((1 - v['soc']) * v['cap'] / dt, v['rate'], (h2_store_flow_max - h2_store_flow))
+                # print(f'{v['id']} flow max: {h2_flow_v_max:.2f} kg/h')
+
+                v['flow'] = h2_flow_v_max   # Carico il veicolo alla massima portata
+                v['soc'] = v['soc'] + v['flow'] * dt / v['cap']
+
+                h2_store_flow_v = float(min(v['flow'], h2_flow_av_store))   # Di questa portata, prendo tutto quello che posso dalla H2S
+
+                h2_store_flow += h2_store_flow_v    # portata istantanea dell'H2S si riduce
+                h2_store_mass -= h2_store_flow_v * dt   # Si riduce anche la quantità accumulata
+
+                h2_flow_EL +=  max(0, v['flow'] - h2_store_flow_v)  # La parte residua me la da l'EL
+                el_power = h2_flow_EL / el_eff
+                h2_flow_av_store -= h2_store_flow_v     # Per il prossimo calcolo, la portata massima dell'EL si riduce
+                h2_flow_av_EL -= max(0, v['flow'] - h2_store_flow_v)    # Per il prossimo calcolo, la portata massima dell'H2S si riduce
+                h2_flow_H2V += v['flow']
+                # if h2_store_mass > m_H2_v_max:
+        else: # Politica di scarica
+            if v['soc'] > 0:
+                v['flow'] = - min(v['cap'] / 11, v['soc'] * v['cap'] / dt)
+                v['soc'] = v['soc'] + v['flow'] * dt / v['cap']
+
+        v['soc_history'].append(v['soc'] * 100.0)
+
+        None
+
+    #
+    pv_res = pv_gen
+    # bess_res = min(bess_p_max, bess_soc * bess_cap / dt)
+
+    # -- Definizione della provenienza dell'energia necessaria all'Elettrolizzatore ---------------------
+    ## Si prende tutto quello che può dal PV
+    el_lack = el_power
+    el_from_pv = min(pv_res, el_lack)
+    el_lack -= el_from_pv
+    pv_res -= el_from_pv
+
+    ## Se ne serve ancora, cerca di prendersela dal BESS
+    el_from_bess = min(el_lack, bess_p_max, bess_soc * bess_cap / dt)
+    el_lack -= el_from_bess
+    bess_power -= el_from_bess
+    # bess_res -= el_from_bess
+    bess_soc -= el_from_bess * dt / bess_cap
+
+    ## l'aliquota residua se la prende dal POD
+    grid_power += el_lack
+    # ---------------------------------------------------------------------------------------------------
+
+    # -- Definizione dell'utilizzo dell'energia fotovoltaica residua ------------------------------------
+    ## Ricarica dello storage di H2
+    if el_power < el_p_max and h2_store_mass < h2_store_cap:
+        el_surplus = min(pv_res,
+                         el_p_max - el_power,                                # La potenza residua dell'EL
+                         (h2_store_cap - h2_store_mass) / (el_eff * dt),     # L'equivalente del residuo ricaricabile della bombola
+                         h2_store_flow_max / el_eff)                         # L'equivalente della massima portata di ricarica della bombola
+        el_power += el_surplus
+        h2_flow_EL += el_surplus * el_eff
+        pv_res -= el_surplus
+        h2_store_flow -= el_surplus * el_eff
+        h2_store_mass += el_surplus * el_eff * dt
+
+    ## Ricarica del BESS
+    if bess_soc < 1:
+        bess_surplus = min(pv_res,  # Potenza residua del PV
+                           bess_p_max,  # Potenza massima assorbibile dal BESS
+                           (1 - bess_soc) * bess_cap / dt)                      # Energia mancante per unità di tempo
+        bess_power += bess_surplus
+        pv_res -= bess_surplus
+        bess_soc += bess_surplus * dt / bess_cap
+
+    grid_power -= pv_res
+    # -- Definizione dell'utilizzo dell'energia fotovoltaica residua ------------------------------------
+
+    grid_power += load
 
 
-        if v['soc'] < 1:
-            h2_flow_v_max = min((1 - v['soc']) * v['cap'] / dt,
-                                v['rate'],
-                                h2_flow_av_store + h2_flow_av_EL)
-            # print((1 - v['soc']) * v['cap'] / dt, v['rate'], (h2_store_flow_max - h2_store_flow))
-            # print(f'{v['id']} flow max: {h2_flow_v_max:.2f} kg/h')
-            v['flow'] = h2_flow_v_max
-            v['soc'] = v['soc'] + v['flow'] * dt / v['cap']
+    # -- Calcolo dell'energia ---------------------------------------------------------------------------
+    pod_en += grid_power * dt
+    el_en += el_power * dt
+    bess_en += bess_power * dt
+    load_en += load * dt
+    pv_en += pv_gen * dt
 
-            h2_store_flow_v = float(min(v['flow'], h2_flow_av_store))
-
-            h2_store_flow += h2_store_flow_v
-            h2_store_mass -= h2_store_flow_v * dt
-            h2_flow_EL +=  max(0, v['flow'] - h2_store_flow_v)
-
-            h2_flow_av_store -= h2_store_flow_v
-            h2_flow_av_EL -= max(0, v['flow'] - h2_store_flow_v)
-
-            # if h2_store_mass > m_H2_v_max:
-            if v['id'] == 'Forklift_1':
-                print(f'Flow: {v['flow']:.2f} g/h')
-                print(f'SOC: {v['soc']:.2f}%')
-                print(f'mass: {(v['soc'] * v['cap']):.2f} g\n')
-
-
-
-
-
+    # print(f'Ora: {ora_str}\tPV: {pv_gen:.2f} kW\tEL: {el_power:.2f} kW\t PV_res: {pv_res:.2f} kW\t'
+    #       f'BESS: {bess_soc * 100:.2f}%\tBESS_P: {bess_power:.2f} kW')
 
     # # -------------------------------------------------------------
     # # NUOVA CASCATA DI DISPACCIAMENTO ENERGETICO COERENTE
@@ -272,8 +349,12 @@ for idx, row in df.iloc[1:].iterrows():
     #                         exact_min = current_total_minutes + minute_substep + 1
     #                         v['end_time'] = f"{exact_min // 60:02d}:{exact_min % 60:02d}"
     #
-    for v in vehicles:
-        v['soc_history'].append((v['soc'] / v['cap']) * 100.0)
+    # for v in vehicles:
+    #     if v['id'] == 'Forklift_1':
+    #         print(
+    #             f'Time: {ora_str}\tFlow: {v['flow']:.2f} g/h\tSOC: {v['soc'] * 100:.2f}%\tmass: {(v['soc'] * v['cap']):.2f} g')
+    #     v['soc_history'].append((v['soc'] / v['cap']) * 100.0)
+    # print(f'veicolo {vehicles[5]['id']}\t{vehicles[5]['soc_history']}')
     #
     step_res = {
         'Ora': ora_str,
@@ -282,12 +363,15 @@ for idx, row in df.iloc[1:].iterrows():
         'Grid_Power_kW': grid_power,
         'BESS_Power_kW': bess_power,
         'Electrolyzer_Power_kW': el_power,
-        'BESS_SOC_kWh': bess_soc,
-        'BESS_SOC_Percent': (bess_soc / bess_cap) * 100.0,
+        'BESS_SOC_kWh': bess_soc + bess_cap,
+        'BESS_SOC_Percent': bess_soc * 100.0,
         'H2_Storage_kg': h2_store_mass,
         'H2_Storage_Percent': (h2_store_mass / h2_store_cap) * 100.0,
         'H2_Produced_kg': h2_produced,
-        'H2_Dispensed_Total_kg': h2_dispensed_step
+        'H2_Dispensed_Total_kg': h2_dispensed_step,
+        'H2_flow_EL': h2_flow_EL,
+        'H2_flow_H2S': h2_store_flow,
+        'H2_flow_H2V': h2_flow_H2V,
     }
     for v in vehicles:
         step_res[f"{v['id']}_SOC_kg"] = v['soc']
@@ -319,12 +403,20 @@ for v in vehicles:
     print(f"Veicolo: {v['id']} | SOC Finale: {v['soc']:.3f} / {v['cap']} kg | "
           f"Minuti di carica: {v['charging_minutes']:.0f} min | "
           f"Inizio: {v['start_time']} | Fine: {v['end_time'] if v['end_time'] else 'Non completato'}")
+
+print('\n\n')
+print(f'Energia al POD: {pod_en:.2f} kWh')
+print(f'Energia Elettrolizzatore: {el_en:.2f} kWh')
+print(f'Energia BESS: {bess_en:.2f} kWh')
+print(f'Energia FotoVoltaica: {pv_en:.2f} kWh')
+print(f'Energia Carichi: {load_en:.2f} kWh')
+
 print("==================================================")
 
 # ==========================================
 # 5. GENERAZIONE DEI GRAFICI (4 Subplots)
 # ==========================================
-fig, axs = plt.subplots(4, 1, figsize=(10, 16), sharex=True)
+fig, axs = plt.subplots(5, 1, figsize=(10, 16), sharex=True)
 
 # 1. H2 Storage SOC%
 axs[0].plot(df_res['Ora'], df_res['H2_Storage_Percent'], color='darkcyan', linewidth=2.5)
@@ -367,6 +459,16 @@ axs[3].set_xlabel('Orario')
 axs[3].set_title('4. Profili di Potenza (EL, BESS, PV, LOAD, Rete Esterna)')
 axs[3].grid(True, linestyle=':', alpha=0.6)
 axs[3].legend(loc='upper right', fontsize=8)
+
+# 5. Flussi di H2
+axs[4].plot(df_res['Ora'], df_res['H2_flow_EL'], color='royalblue', linewidth=2.5, label='EL')
+axs[4].plot(df_res['Ora'], df_res['H2_flow_H2S'], color='orange', linewidth=2.5, label=' H2S')
+axs[4].plot(df_res['Ora'], df_res['H2_flow_H2V'], color='gold', linewidth=2.5, label=' H2V')
+axs[4].axvline(x='07:00', color='red', linestyle='--')
+axs[4].set_ylabel('Flusso H2')
+axs[4].set_title('Prelievo di potenza dal POD')
+axs[4].grid(True, linestyle=':', alpha=0.6)
+axs[4].legend(loc='upper right', fontsize=8)
 
 plt.xticks(df_res['Ora'][::8], rotation=45)
 plt.tight_layout()
