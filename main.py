@@ -1,7 +1,7 @@
 import datetime
 
 import pandas as pd
-import numpy as np
+# import numpy as np
 import matplotlib.pyplot as plt
 
 # ==========================================
@@ -30,19 +30,22 @@ initial_h2_mass = h2_store_cap * 0.0  # g (100% - Target fine/inizio giornata)
 h2_store_mass = initial_h2_mass
 h2_store_flow = 0.0     # FLusso istantaneo
 
-el_p_max = 9.0  # Potenza massima nominale EL = 9 kW
+el_p_max = 9  # Potenza massima nominale EL = 9 kW
 el_eff = 22.0   # g/kWh (22 g/kW)
 h2_flow_EL = 0.0
 h2_flow_av_EL = el_p_max * el_eff  # Caso in cui non ho limiti sull'elettrolizzatore
 el_en = 0.0
 
-# Flotta veicoli inizialmente completamente scarichi (SOC = 0.0)
+# Flotta veicoli inizialmente completamente carichi (SOC = 1.0)
+
+h2v_chg_max_n = 7
+
 vehicles = []
-for i in range(5):
+for i in range(4):
     vehicles.append({
         'id': f'CargoBike_{i + 1}',
         'cap': 100,  # g
-        'rate': 500,  #  g/h = 8.33 g/min
+        'rate': 500,  # g/h = 8.33 g/min
         'soc': 1.0,
         'flow': 0.0,
         'start_time': None,
@@ -53,13 +56,15 @@ for i in range(2):
     vehicles.append({
         'id': f'Forklift_{i + 1}',
         'cap': 1800.0,  # g
-        'rate': 3000.0,  # g/h = 50.0 g/min
+        'rate': 3000.0,  # g/h = 50.0 g/m4.2n
         'soc': 1.0,
         'flow': 0.0,
         'start_time': None,
         'end_time': None,
         'charging_minutes': 0.0
     })
+h2v_prod = 0.0
+
 
 results = []
 
@@ -88,14 +93,14 @@ step_init = {
 for v in vehicles:
     step_init[f"{v['id']}_SOC_kg"] = v['soc']
     step_init[f"{v['id']}_SOC_Percent"] = (v['soc'] / v['cap']) * 100.0
-    v['soc_history'] = [100]
+    v['soc_history'] = []
 
-results.append(step_init)
+# results.append(step_init)
 
 # ==========================================
 # 2. CICLO DI SIMULAZIONE TEMPORALE
 # ==========================================
-for idx, row in df.iloc[1:].iterrows():
+for idx, row in df.iloc[0:].iterrows():
     load = row['P LOAD  [kW]']
     irr = row['Irr PV [W(m2)']
     temp = row['T PV [°C]']
@@ -103,11 +108,16 @@ for idx, row in df.iloc[1:].iterrows():
 
     if hasattr(ora_val, 'hour') and hasattr(ora_val, 'minute'):
         current_total_minutes = ora_val.hour * 60 + ora_val.minute
-        ora_str = f"{ora_val.hour:02d}:{ora_val.minute:02d}"
+        try:
+            ora_str = f"G{ora_val.day}:{ora_val.hour:02d}:{ora_val.minute:02d}"
+        except AttributeError:
+            ora_str = f"{ora_val.hour:02d}:{ora_val.minute:02d}"
     else:
         h_parts = list(map(int, str(ora_val).split(':')[:2]))
         current_total_minutes = h_parts[0] * 60 + h_parts[1]
         ora_str = str(ora_val)[:5]
+
+    curr_time = ora_val.hour + ora_val.minute / 60
 
     # Modellazione PV con correzione termica
     t_cell = temp + irr * 0.03
@@ -133,20 +143,26 @@ for idx, row in df.iloc[1:].iterrows():
 
     h2_flow_av_store = min(h2_store_mass / dt, (h2_store_flow_max - h2_store_flow))
 
+    h2v_chg_curr_n = 0
 
-    # IMPORTANTE: Codice aggiunto da AR
+    h2v_to_chg = 0
+    for v in vehicles:
+        if v['soc'] < 1:
+            h2v_to_chg += 1
+    h2v_max_session = min(h2v_to_chg, h2v_chg_max_n)
+
     for v in vehicles:
         h2_flow_demand = 0.0     # Richiesta totale di H2 da parte dei veicoli
 
         # TODO: l'orario deve essere generalizzato
         # Politica di ricarica
-        if ora_val <= datetime.time(7, 0) or ora_val >= datetime.time(18, 0):
-            if v['soc'] < 1:
+        if curr_time <= 7 or curr_time > 17:
+            if v['soc'] < 1 and h2v_chg_curr_n < h2v_chg_max_n:
                 # La portata massima dipende da quanto H2 posso inserire in ogni veicolo, dalla portata massima del veicolo
                 # e da quanto può erogare sia l'H2S che l'EL
                 h2_flow_v_max = min((1 - v['soc']) * v['cap'] / dt,
                                     v['rate'],
-                                    h2_flow_av_store + h2_flow_av_EL)
+                                    (h2_flow_av_store + h2_flow_av_EL) / h2v_max_session)
                 # print((1 - v['soc']) * v['cap'] / dt, v['rate'], (h2_store_flow_max - h2_store_flow))
                 # print(f'{v['id']} flow max: {h2_flow_v_max:.2f} kg/h')
 
@@ -163,10 +179,14 @@ for idx, row in df.iloc[1:].iterrows():
                 h2_flow_av_store -= h2_store_flow_v     # Per il prossimo calcolo, la portata massima dell'EL si riduce
                 h2_flow_av_EL -= max(0, v['flow'] - h2_store_flow_v)    # Per il prossimo calcolo, la portata massima dell'H2S si riduce
                 h2_flow_H2V += v['flow']
+
+                if v['flow'] > 0:
+                    h2v_chg_curr_n += 1
+                    h2v_max_session -= 1
                 # if h2_store_mass > m_H2_v_max:
         else: # Politica di scarica
             if v['soc'] > 0:
-                v['flow'] = - min(v['cap'] / 11, v['soc'] * v['cap'] / dt)
+                v['flow'] = - min(v['cap'] / 10, v['soc'] * v['cap'] / dt)
                 v['soc'] = v['soc'] + v['flow'] * dt / v['cap']
 
         v['soc_history'].append(v['soc'] * 100.0)
@@ -229,6 +249,7 @@ for idx, row in df.iloc[1:].iterrows():
     bess_en += bess_power * dt
     load_en += load * dt
     pv_en += pv_gen * dt
+    h2v_prod += h2_flow_H2V * dt
 
     # print(f'Ora: {ora_str}\tPV: {pv_gen:.2f} kW\tEL: {el_power:.2f} kW\t PV_res: {pv_res:.2f} kW\t'
     #       f'BESS: {bess_soc * 100:.2f}%\tBESS_P: {bess_power:.2f} kW')
@@ -410,6 +431,7 @@ print(f'Energia Elettrolizzatore: {el_en:.2f} kWh')
 print(f'Energia BESS: {bess_en:.2f} kWh')
 print(f'Energia FotoVoltaica: {pv_en:.2f} kWh')
 print(f'Energia Carichi: {load_en:.2f} kWh')
+print(f'H2 prodotto: {h2v_prod:.4f} g')
 
 print("==================================================")
 
