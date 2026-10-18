@@ -88,6 +88,7 @@ class Model:
                 'charge_slot': [0, 24],
                 'in_charge': False,
                 'to_charge': False,
+                'working_time': 0,
             })
 
         for i in range(2):
@@ -105,6 +106,7 @@ class Model:
                 'charge_slot': [0, 24],
                 'in_charge': False,
                 'to_charge': False,
+                'working_time': 0,
             })
         self.h2v_prod = 0.0
 
@@ -127,6 +129,12 @@ class Model:
         # ==========================================
         h2v_to_chg_order = []
         h2v_in_chg_order = []
+
+        self.h2v_av_time = 0
+        self.el_max_expl = 0
+
+        for v in self.vehicles:
+            v['working_time'] = 0
 
         for idx, row in self.df.iloc[0:].iterrows():
             self.par['load']['p'] = row['P_LOAD_[kW]']  # Nome corretto dal generatore
@@ -255,6 +263,8 @@ class Model:
 
                 v['soc_history'].append(v['soc'] * 100.0)
 
+                v['working_time'] += self.dt * int(v['flow'] < 0)
+
             # -- calcolo della disponibilità del sistema --------------------------------------------------------
             self.h2v_av_time += (
                     self.dt * int(self.par['h2v']['flow'] >= min(self.par['el']['p_rate'] * self.par['el']['eff'],
@@ -356,6 +366,18 @@ class Model:
             self.results.append(step_res)
 
         self.df_res = pd.DataFrame(self.results)
+
+        kpi = {
+            'use_case': uc,
+            'sim_charge': self.h2v_chg_max_n,
+            'charge_avail': self.h2v_av_time / len(self.df) * 4 * 100,
+            'el_use_rate': self.el_max_expl / len(self.df) * 4 * 100,
+        }
+
+        for v in self.vehicles:
+            kpi[f'{v['id']}_use_rate'] = v['working_time'] / len(self.df) * 4 * 100
+
+        return kpi
 
     def xlsx_export(self, excel_output_filename="risultati_dettagliati_microgrid.xlsx"):
         # ==========================================
