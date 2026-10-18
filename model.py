@@ -54,20 +54,22 @@ params = {
 
 
 class Model:
-    def __init__(self, excel_file='dati test.xlsx', dt=0.25, par=params, h2v_chg_max_n=3, t_s=7.0, t_e=17.0):
+    def __init__(self, df, dt=0.25, par=params, h2v_chg_max_n=3):
         # ==========================================
         # 1. CARICAMENTO DATI E INIZIALIZZAZIONE
         # ==========================================
-        self.df = pd.read_excel(excel_file)
+        self.df = df
         self.n_steps = len(self.df)
         self.dt = dt  # Intervalli di 15 minuti in ore
 
         self.h2v_chg_max_n = h2v_chg_max_n
 
         self.par = par
-        self.t_s, self.t_e = t_s, t_e
 
         self.df_res = None
+        self.h2v_av_time = 0
+        self.el_max_expl = 0
+        self.el_full_use_rate = 0
 
         # Flotta veicoli inizialmente completamente carichi (SOC = 1.0)
         self.vehicles = []
@@ -77,12 +79,12 @@ class Model:
                 'cap': 100,  # g
                 'rate': 500,  # g/h = 8.33 g/min
                 'cons': 9.0,    # g/h di H2 consumati mentre è in funzione
-                'soc': 0.4,
+                'soc': 1,
                 'flow': 0.0,
                 'start_time': None,
                 'end_time': None,
                 'charging_minutes': 0.0,
-                'work_slot': [0, 24],
+                'work_slot': [0,24],
                 'charge_slot': [0, 24],
                 'in_charge': False,
                 'to_charge': False,
@@ -99,46 +101,27 @@ class Model:
                 'start_time': None,
                 'end_time': None,
                 'charging_minutes': 0.0,
-                'work_slot': [7, 17],
+                'work_slot': [0, 24],
                 'charge_slot': [0, 24],
                 'in_charge': False,
                 'to_charge': False,
             })
         self.h2v_prod = 0.0
 
-
         self.results = []
 
         # Registrazione dello stato iniziale (00:00)
         first_row = self.df.iloc[0]
-        self.ora_val = first_row['Ora']
-        self.ora_str = f"{self.ora_val.hour:02d}:{self.ora_val.minute:02d}" if hasattr(self.ora_val, 'hour') \
-            else str(self.ora_val)[:5]
+        # Leggiamo il timestamp dalla colonna 'Timestamp'
+        timestamp_val = pd.to_datetime(first_row['Timestamp'])
+        self.ora_val = timestamp_val.time()
+        self.ora_str = timestamp_val.strftime('%Y-%m-%d %H:%M')
 
-        # step_init = {
-        #     'Ora': ora_str,
-        #     'P_LOAD_kW': 0.0,
-        #     'P_PV_kW': 0.0,
-        #     'Grid_Power_kW': 0.0,
-        #     'BESS_Power_kW': 0.0,
-        #     'Electrolyzer_Power_kW': 0.0,
-        #     'BESS_SOC_kWh': bess_soc * bess_cap,
-        #     'BESS_SOC_Percent': bess_soc * 100.0,
-        #     'H2_Storage_kg': h2_store_mass,
-        #     'H2_Storage_Percent': (h2_store_mass / h2_store_cap) * 100.0,
-        #     'H2_Produced_kg': 0.0,
-        #     'H2_Dispensed_Total_kg': 0.0,
-        #     'H2_flow_EL': 0.0,
-        #     'H2_flow_H2S': 0.0,
-        #     'H2_flow_H2V': 0.0,
-        # }
         for v in self.vehicles:
-            # step_init[f"{v['id']}_SOC_kg"] = v['soc']
-            # step_init[f"{v['id']}_SOC_Percent"] = (v['soc'] / v['cap']) * 100.0
             v['soc_history'] = []
 
 # results.append(step_init)
-    def sim(self):
+    def sim(self, uc=1):
         # ==========================================
         # 2. CICLO DI SIMULAZIONE TEMPORALE
         # ==========================================
@@ -146,23 +129,13 @@ class Model:
         h2v_in_chg_order = []
 
         for idx, row in self.df.iloc[0:].iterrows():
-            self.par['load']['p'] = row['P LOAD  [kW]']
-            self.par['pv']['irr'] = row['Irr PV [W(m2)']
-            self.par['pv']['temp'] = row['T PV [°C]']
-            ora_val = row['Ora']
+            self.par['load']['p'] = row['P_LOAD_[kW]']  # Nome corretto dal generatore
+            self.par['pv']['irr'] = row['Irr_PV_[W/m2]']  # Nome corretto dal generatore
+            self.par['pv']['temp'] = row['T_PV_[°C]']  # Nome corretto dal generatore
 
-            if hasattr(ora_val, 'hour') and hasattr(ora_val, 'minute'):
-                current_total_minutes = ora_val.hour * 60 + ora_val.minute
-                try:
-                    ora_str = f"G{ora_val.day}:{ora_val.hour:02d}:{ora_val.minute:02d}"
-                except AttributeError:
-                    ora_str = f"{ora_val.hour:02d}:{ora_val.minute:02d}"
-            else:
-                h_parts = list(map(int, str(ora_val).split(':')[:2]))
-                current_total_minutes = h_parts[0] * 60 + h_parts[1]
-                ora_str = str(ora_val)[:5]
-
-            curr_time = ora_val.hour + ora_val.minute / 60
+            timestamp_val = pd.to_datetime(row['Timestamp'])
+            curr_time = timestamp_val.hour + timestamp_val.minute / 60.0
+            ora_str = timestamp_val.strftime('%Y-%m-%d %H:%M')
 
             # Modellazione PV con correzione termica
             self.par['pv']['t_cell'] = self.par['pv']['temp'] + self.par['pv']['irr'] * 0.03
@@ -170,43 +143,31 @@ class Model:
                                       self. par['pv']['p_rate'] * (self.par['pv']['irr'] / 1000.0) *
                                       (1.0 - 0.004 * (self.par['pv']['t_cell'] - 25.0)))
 
-            # print(f'Ora: {ora_str}\t irr: {self.par['pv']['irr']} W/m2\t T_amb: {self.par['pv']['temp']} °C\t T cell: {self.par['pv']['t_cell']:.2f} °C\t P_PV: {self.par['pv']['p']} kW')
-            # pv_energy = pv_gen * self.dt  # kWh
-
-            # is_h2_priority_window = (current_total_minutes < 420)
-            # active_vehicles = [v for v in self.vehicles if v['cap'] - v['soc'] > 1e-4] if is_h2_priority_window else []
-
             self.par['el']['p'] = 0.0
             # h2_produced = 0.0
             self.par['bess']['p'] = 0.0
             self.par['pod']['p'] = 0.0
 
-            # h2_dispensed_step = 0.0     # Todo: To delete
-
             self.par['h2s']['flow'] = 0.0
             self.par['el']['flow'] = 0.0
             self.par['h2v']['flow'] = 0.0
-            # h2_store_flow = 0.0
-            # h2_flow_EL = 0.0
-            # h2_flow_H2V = 0.0
 
-            h2_flow_av_el = self.par['el']['p_rate'] * self.par['el']['eff']  # Caso in cui non ho limiti sull'elettrolizzatore
-            # h2_flow_av_EL = min(el_p_max, pv_gen) * el_eff   # Caso in cui produco solo da PV
+            if uc == 1: # Caso in cui produco solo da PV senza accumulo
+                p_av_bess = min(self.par['bess']['p_rate'], self.par['bess']['soc'] * self.par['bess']['cap'] / self.dt)
+                h2_flow_av_el = min(self.par['el']['p_rate'], self.par['pv']['p'] + p_av_bess) * self.par['el']['eff']
+                h2_flow_av_store = 0
+            elif uc == 2:
+                p_av_bess = min(self.par['bess']['p_rate'], self.par['bess']['soc'] * self.par['bess']['cap'] / self.dt)
+                h2_flow_av_el = min(self.par['el']['p_rate'], self.par['pv']['p'] + p_av_bess) * self.par['el']['eff']
+                h2_flow_av_store = min(self.par['h2s']['soc'] * self.par['h2s']['cap'] / self.dt,
+                                       (self.par['h2s']['flow_rate'] - self.par['h2s']['flow']))
+            else:
+                h2_flow_av_el = self.par['el']['p_rate'] * self.par['el']['eff']  # Caso in cui non ho limiti sull'elettrolizzatore
+                h2_flow_av_store = min(self.par['h2s']['soc'] * self.par['h2s']['cap'] / self.dt,
+                                       (self.par['h2s']['flow_rate'] - self.par['h2s']['flow']))
 
-            h2_flow_av_store = min(self.par['h2s']['soc'] * self.par['h2s']['cap'] / self.dt,
-                                   (self.par['h2s']['flow_rate'] - self.par['h2s']['flow']))
-
-            h2v_chg_curr_n = 0
-            # for v in self.vehicles:
-            #     if v['in_charge']:
-            #         h2v_chg_curr_n += 1
-
-            h2v_to_chg = 0
-
-
-
-            if ora_str == "G1:23:00":
-                print('èora')
+            # if ora_str == "G1:23:00":
+            #     print('èora')
 
             for i in range(len(self.vehicles)):
                 v = self.vehicles[i]
@@ -220,12 +181,7 @@ class Model:
                         # h2v_chg_curr_n += 1
                         pass
                     else:
-                        # v['in_charge'] = False
-                        # v['to_charge'] = False
-
                         h2v_to_chg_order.remove(i)
-
-                        print('==')
                         h2v_in_chg_order.remove(i)
 
             av = self.h2v_chg_max_n - len(h2v_in_chg_order)
@@ -236,8 +192,18 @@ class Model:
 
             h2v_to_chg = len(h2v_in_chg_order)
 
+            # -- Definizione della massima richiesta ammissibile di H2
             h2v_max_session = min(h2v_to_chg, self.h2v_chg_max_n)
-            print(f'Ora: {ora_str}\tIn ricarica: {len(h2v_in_chg_order)}')
+            # print(f'Ora: {ora_str}\tIn ricarica: {len(h2v_in_chg_order)}')
+
+            # -- Definizione della richiesta di H2 della sessione --
+            h2_demand = 0
+            for i in h2v_in_chg_order:
+                v = self.vehicles[i]
+                h2_demand += min(v['rate'], (1 - v['soc']) * v['cap'] / self.dt)
+
+            # print(f'Ora: {self.ora_val}\tRichiesta H2: {h2_demand:.2f} g/h')
+            # ------------------------------------------------------
 
             all_v = list(range(len(self.vehicles)))
 
@@ -245,32 +211,17 @@ class Model:
             for i in all_v:
                 if i not in h2v_in_chg_order:
                     sort_v.append(i)
-            print(sort_v)
+            # print(sort_v)
             for i in sort_v:
 
                 v = self.vehicles[i]
                 if i in h2v_in_chg_order:
-                    # h2_flow_demand = 0.0     # Richiesta totale di H2 da parte dei veicoli
-
-                    # if v['charge_slot'][0] <= curr_time < v['charge_slot'][1] and not v['in_charge']:
-                    #     v['to_charge'] = ((v['work_slot'][0] <= curr_time > v['work_slot'][1] and v['soc'] < 1)
-                    #                       or v['soc'] == 0)
-                    #     h2v_to_chg += 1
-                    # h2v_max_session = min(h2v_to_chg, self.h2v_chg_max_n)
-
-                    # if ora_str == "09:30":
-                    #     print('èora')
-
-                    # if v['to_charge'] and h2v_chg_curr_n < self.h2v_chg_max_n and v['soc'] < 1:
-
                     v['in_charge'] = True
                     # La portata massima dipende da quanto H2 posso inserire in ogni veicolo, dalla portata massima del veicolo
                     # e da quanto può erogare sia l'H2S che l'EL
                     h2_flow_v_max = min((1 - v['soc']) * v['cap'] / self.dt,
                                         v['rate'],
                                         (h2_flow_av_store + h2_flow_av_el) / h2v_max_session)
-                    # print((1 - v['soc']) * v['cap'] / dt, v['rate'], (h2_store_flow_max - h2_store_flow))
-                    # print(f'{v['id']} flow max: {h2_flow_v_max:.2f} kg/h')
 
                     v['flow'] = h2_flow_v_max   # Carico il veicolo alla massima portata
                     v['soc'] = v['soc'] + v['flow'] * self.dt / v['cap']
@@ -288,16 +239,9 @@ class Model:
 
                     if v['flow'] > 0:
                         h2v_max_session -= 1
-                        # if not v['in_charge']:
-                        #     v['in_charge'] = True
-                        #     h2v_chg_curr_n += 1
+
                     if v['soc'] == 1:
                         h2v_in_chg_order.remove(i)
-
-                        # if h2_store_mass > m_H2_v_max:
-                    # elif v['soc'] == 1:
-                    #     v['in_charge'] = False
-                    #     v['to_charge'] = False
 
                 else:
                     if v['work_slot'][0] <= curr_time < v['work_slot'][1]:
@@ -306,12 +250,21 @@ class Model:
                             v['soc'] = v['soc'] + v['flow'] * self.dt / v['cap']
                         else:
                             v['flow'] = 0
+                    else:
+                        v['flow'] = 0
 
                 v['soc_history'].append(v['soc'] * 100.0)
 
+            # -- calcolo della disponibilità del sistema --------------------------------------------------------
+            self.h2v_av_time += (
+                    self.dt * int(self.par['h2v']['flow'] >= min(self.par['el']['p_rate'] * self.par['el']['eff'],
+                                                                 h2_demand) - 0.0001))
+
+            self.el_max_expl += self.dt * int(self.par['el']['p'] >= self.par['el']['p_rate'] * 0.999)
+            # ---------------------------------------------------------------------------------------------------
+
             #
             pv_res = self.par['pv']['p']
-            # bess_res = min(bess_p_max, bess_soc * bess_cap / dt)
 
             # -- Definizione della provenienza dell'energia necessaria all'Elettrolizzatore ---------------------
             ## Si prende tutto quello che può dal PV
@@ -334,18 +287,30 @@ class Model:
             # ---------------------------------------------------------------------------------------------------
 
             # -- Definizione dell'utilizzo dell'energia fotovoltaica residua ------------------------------------
-            ## Ricarica dello storage di H2
-            if self.par['el']['p'] < self.par['bess']['p_rate'] and self.par['h2s']['soc'] < 1:
-                el_surplus = min(pv_res,
-                                 self.par['el']['p_rate'] - self.par['el']['p'],                                # La potenza residua dell'EL
-                                 (1 - self.par['h2s']['soc']) * self.par['h2s']['cap'] / (self.par['el']['eff'] * self.dt),     # L'equivalente del residuo ricaricabile della bombola
-                                 self.par['h2s']['flow_rate'] / self.par['el']['eff'])                         # L'equivalente della massima portata di ricarica della bombola
-                self.par['el']['p'] += el_surplus
-                self.par['el']['flow'] += el_surplus * self.par['el']['eff']
-                pv_res -= el_surplus
-                self.par['h2s']['flow'] -= el_surplus * self.par['el']['eff']
-                self.par['h2s']['soc'] += el_surplus * self.par['el']['eff'] * self.dt / self.par['h2s']['cap']
-                # h2_store_mass += el_surplus * el_eff * dt
+            if uc == 1:
+                pv_res -= min(pv_res, self.par['load']['p'])
+                # if pv_res <= self.par['load']['p']:
+                #     pv_res = 0
+                # else:
+                #     pv_res -= self.par['load']['p']
+                #     # self.par['pod']['p'] = 0
+
+            else:
+                ## Ricarica dello storage di H2
+                if self.par['el']['p'] < self.par['bess']['p_rate'] and self.par['h2s']['soc'] < 1 and uc != 1:
+                    el_surplus = min(pv_res,
+                                     self.par['el']['p_rate'] - self.par['el']['p'],                                # La potenza residua dell'EL
+                                     (1 - self.par['h2s']['soc']) * self.par['h2s']['cap'] / (self.par['el']['eff'] * self.dt),     # L'equivalente del residuo ricaricabile della bombola
+                                     self.par['h2s']['flow_rate'] / self.par['el']['eff'])                         # L'equivalente della massima portata di ricarica della bombola
+                    self.par['el']['p'] += el_surplus
+                    self.par['el']['flow'] += el_surplus * self.par['el']['eff']
+                    pv_res -= el_surplus
+                    self.par['h2s']['flow'] -= el_surplus * self.par['el']['eff']
+                    self.par['h2s']['soc'] += el_surplus * self.par['el']['eff'] * self.dt / self.par['h2s']['cap']
+                    # h2_store_mass += el_surplus * el_eff * dt
+
+            # if uc == 1:
+            #     if
 
             ## Ricarica del BESS
             if self.par['bess']['soc'] < 1:
@@ -353,14 +318,11 @@ class Model:
                                    self.par['bess']['p_rate'],  # Potenza massima assorbibile dal BESS
                                    (1 - self.par['bess']['soc']) * self.par['bess']['cap'] / self.dt)                      # Energia mancante per unità di tempo
                 self.par['bess']['p'] += bess_surplus
-                pv_res -= bess_surplus
+                # pv_res -= bess_surplus
                 self.par['bess']['soc'] += bess_surplus * self.dt / self.par['bess']['cap']
 
-            self.par['pod']['p'] -= pv_res
-            # -- Definizione dell'utilizzo dell'energia fotovoltaica residua ------------------------------------
-
-            self.par['pod']['p'] += self.par['load']['p']
-
+            self.par['pod']['p'] = (self.par['load']['p'] + self.par['el']['p'] + self.par['bess']['p'] -
+                                    self.par['pv']['p'])
 
             # -- Calcolo dell'energia ---------------------------------------------------------------------------
             for el in ['pod', 'el', 'bess', 'pv', 'load']:
@@ -368,138 +330,6 @@ class Model:
 
             self.par['h2v']['uptake'] += self.par['h2v']['flow'] * self.dt
 
-            # pod_en += grid_power * dt
-            # el_en += el_power * dt
-            # bess_en += bess_power * dt
-            # load_en += load * dt
-            # pv_en += pv_gen * dt
-            # h2v_prod += h2_flow_H2V * dt
-
-            # print(f'Ora: {ora_str}\tPV: {pv_gen:.2f} kW\tEL: {el_power:.2f} kW\t PV_res: {pv_res:.2f} kW\t'
-            #       f'BESS: {bess_soc * 100:.2f}%\tBESS_P: {bess_power:.2f} kW')
-
-            # # -------------------------------------------------------------
-            # # NUOVA CASCATA DI DISPACCIAMENTO ENERGETICO COERENTE
-            # # -------------------------------------------------------------
-            #
-            # # A. Copertura del Carico utenza (LOAD) tramite PV
-            # load_energy = load * dt
-            # energy_for_load_from_pv = min(load_energy, pv_energy)
-            # pv_energy -= energy_for_load_from_pv
-            # remaining_load_energy = load_energy - energy_for_load_from_pv
-            #
-            # # B. Alimentazione Elettrolizzatore con PV residuo (o BESS/Rete se in finestra prioritaria H2)
-            # h2_needed_for_vehicles = sum([v['cap'] - v['soc'] for v in active_vehicles])
-            # h2_needed_for_storage = max(0.0, initial_h2_mass - h2_store_mass)
-            #
-            # el_energy_needed = 0.0
-            # if h2_needed_for_vehicles > 0 or (not is_h2_priority_window and h2_needed_for_storage > 0):
-            #     target_h2_step = min(5.0 * dt,
-            #                          h2_needed_for_vehicles + (h2_needed_for_storage if not is_h2_priority_window else 0.0))
-            #     el_energy_needed = min(el_p_max * dt, target_h2_step / el_eff)
-            #
-            # energy_for_el_from_pv = min(el_energy_needed, pv_energy)
-            # pv_energy -= energy_for_el_from_pv
-            # remaining_el_energy = el_energy_needed - energy_for_el_from_pv
-            #
-            # energy_for_el_from_bess = 0.0
-            # if remaining_el_energy > 0 and bess_soc > 1e-4:
-            #     max_bess_discharge = min(bess_p_max * dt, bess_soc)
-            #     energy_for_el_from_bess = min(remaining_el_energy, max_bess_discharge)
-            #     bess_soc = max(0.0, bess_soc - energy_for_el_from_bess)
-            #     remaining_el_energy -= energy_for_el_from_bess
-            #     bess_power = -energy_for_el_from_bess / dt
-            #
-            # energy_for_el_from_grid = 0.0
-            # if remaining_el_energy > 0:
-            #     grid_for_el_power = min(grid_limit, remaining_el_energy / dt)
-            #     energy_for_el_from_grid = grid_for_el_power * dt
-            #     remaining_el_energy -= energy_for_el_from_grid
-            #     grid_power += grid_for_el_power
-            #
-            # total_el_energy = energy_for_el_from_pv + energy_for_el_from_bess + energy_for_el_from_grid
-            # if total_el_energy > 0:
-            #     el_power = total_el_energy / dt
-            #     h2_produced = total_el_energy * el_eff
-            #
-            # # C. Sfruttamento dell'esubero PV (dalle 11:00 in poi) per ricaricare il BESS fino a target 12 kWh
-            # energy_for_bess = 0.0
-            # bess_deficit = initial_bess_soc - bess_soc
-            # if pv_energy > 0 and bess_deficit > 1e-4:
-            #     bess_space = bess_cap - bess_soc
-            #     max_bess_charge_energy = min(bess_p_max * dt, bess_space)
-            #     energy_for_bess = min(max_bess_charge_energy, bess_deficit / 0.95, pv_energy)
-            #     pv_energy -= energy_for_bess
-            #     bess_soc += energy_for_bess * 0.95
-            #     bess_power = energy_for_bess / dt  # Positivo = Carica BESS
-            #
-            # # D. Eventuale fabbisogno residuo del carico coperto da BESS o Rete
-            # if remaining_load_energy > 0 and bess_soc > 1e-4:
-            #     max_bess_discharge = min(bess_p_max * dt, bess_soc)
-            #     energy_for_load_from_bess = min(remaining_load_energy, max_bess_discharge)
-            #     bess_soc = max(0.0, bess_soc - energy_for_load_from_bess)
-            #     remaining_load_energy -= energy_for_load_from_bess
-            #
-            #     discharge_kw = energy_for_load_from_bess / dt
-            #     if bess_power >= 0:
-            #         bess_power = -discharge_kw
-            #     else:
-            #         bess_power -= discharge_kw
-            #
-            # if remaining_load_energy > 0:
-            #     grid_import_load = min(grid_limit - grid_power, remaining_load_energy / dt)
-            #     grid_power += max(0.0, grid_import_load)
-            #
-            # # E. Se c'è ulteriore surplus PV dopo aver caricato il BESS, immettiamo in rete
-            # if pv_energy > 0:
-            #     grid_power = - (pv_energy / dt)
-            #
-            # # Controllo di sicurezza: se il BESS è a zero, potenza rigorosamente a 0
-            # if bess_soc <= 1e-4:
-            #     bess_power = 0.0
-            #
-            # # Aggiornamento accumulo H2 stazionario
-            # h2_produced = min(h2_produced, h2_store_cap - h2_store_mass, h2_store_flow_max * dt)
-            # h2_store_mass += h2_produced
-            #
-            # # Ricarica fisica flotta veicoli minuto per minuto (entro le 07:00)
-            # h2_dispensed_step = 0.0
-            # if is_h2_priority_window:
-            #     active_vehicles = [v for v in vehicles if v['cap'] - v['soc'] > 1e-4]
-            #     if active_vehicles and h2_store_mass > 1e-4:
-            #         for minute_substep in range(15):
-            #             if h2_store_mass <= 1e-4:
-            #                 break
-            #             active_vehicles = [v for v in vehicles if v['cap'] - v['soc'] > 1e-4]
-            #             if not active_vehicles:
-            #                 break
-            #             max_flow_per_min = (h2_store_flow_max / 60.0)
-            #             total_demanded_rate = sum([min(v['rate'] / 60.0, v['cap'] - v['soc']) for v in active_vehicles])
-            #             scaling_factor = min(1.0, max_flow_per_min / total_demanded_rate) if total_demanded_rate > 0 else 0.0
-            #
-            #             for v in active_vehicles:
-            #                 needed = v['cap'] - v['soc']
-            #                 if needed > 1e-4:
-            #                     if v['start_time'] is None:
-            #                         exact_min = current_total_minutes + minute_substep
-            #                         v['start_time'] = f"{exact_min // 60:02d}:{exact_min % 60:02d}"
-            #                     v_rate_min = (v['rate'] / 60.0) * scaling_factor
-            #                     h2_to_give = min(needed, v_rate_min, h2_store_mass)
-            #                     if h2_to_give > 0:
-            #                         v['soc'] += h2_to_give
-            #                         h2_store_mass -= h2_to_give
-            #                         h2_dispensed_step += h2_to_give
-            #                         v['charging_minutes'] += 1.0
-            #                     if abs(v['cap'] - v['soc']) < 1e-4 and v['end_time'] is None:
-            #                         exact_min = current_total_minutes + minute_substep + 1
-            #                         v['end_time'] = f"{exact_min // 60:02d}:{exact_min % 60:02d}"
-            #
-            # for v in vehicles:
-            #     if v['id'] == 'Forklift_1':
-            #         print(
-            #             f'Time: {ora_str}\tFlow: {v['flow']:.2f} g/h\tSOC: {v['soc'] * 100:.2f}%\tmass: {(v['soc'] * v['cap']):.2f} g')
-            #     v['soc_history'].append((v['soc'] / v['cap']) * 100.0)
-            # print(f'veicolo {vehicles[5]['id']}\t{vehicles[5]['soc_history']}')
             #
             step_res = {
                 'Ora': ora_str,
@@ -559,6 +389,8 @@ class Model:
         print(f'Energia FotoVoltaica: {self.par['pv']['en']:.2f} kWh')
         print(f'Energia Carichi: {self.par['load']['en']:.2f} kWh')
         print(f'H2 prodotto: {self.par['h2v']['uptake']:.1f} g')
+        print(f'Disponibilità del sistema [KPI_17]: {self.h2v_av_time / len(self.df) * 4 * 100:.2f}%')
+        print(f"Tasso di utilizzo dell'elettrolizzatore [KPI_11]: {self.el_max_expl / len(self.df) * 4 * 100:.2f}%")
 
         print("==================================================")
 
@@ -628,7 +460,8 @@ class Model:
 
 
 if __name__ == "__main__":
-    model = Model(h2v_chg_max_n=1)
+    df = pd.read_excel("dati test.xlsx")
+    model = Model(df=df)
     model.sim()
     model.xlsx_export()
     model.output_print()
