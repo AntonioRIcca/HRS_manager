@@ -1,6 +1,8 @@
-a = 10
+a = [1, 2]
+
 b = a
 
-a = 54
+b.append(3)
 
-print(a, b)
+print(a)
+print(b)
