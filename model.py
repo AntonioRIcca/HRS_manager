@@ -54,13 +54,16 @@ params = {
 
 
 class Model:
-    def __init__(self, df, dt=0.25, par=params, h2v_chg_max_n=3):
+    def __init__(self, df, dt=0.25, par=params, h2v_chg_max_n=3, name=''):
         # ==========================================
         # 1. CARICAMENTO DATI E INIZIALIZZAZIONE
         # ==========================================
         self.df = df
         self.n_steps = len(self.df)
         self.dt = dt  # Intervalli di 15 minuti in ore
+
+        self.name = name
+        self.uc = None
 
         self.h2v_chg_max_n = h2v_chg_max_n
 
@@ -127,6 +130,8 @@ class Model:
         # ==========================================
         # 2. CICLO DI SIMULAZIONE TEMPORALE
         # ==========================================
+        self.uc = uc
+
         h2v_to_chg_order = []
         h2v_in_chg_order = []
 
@@ -143,7 +148,10 @@ class Model:
 
             timestamp_val = pd.to_datetime(row['Timestamp'])
             curr_time = timestamp_val.hour + timestamp_val.minute / 60.0
-            ora_str = timestamp_val.strftime('%Y-%m-%d %H:%M')
+            if len(self.df) <= 96:
+                ora_str = timestamp_val.strftime('%H:%M')
+            else:
+                ora_str = timestamp_val.strftime('%Y-%m-%d %H:%M')
 
             # Modellazione PV con correzione termica
             self.par['pv']['t_cell'] = self.par['pv']['temp'] + self.par['pv']['irr'] * 0.03
@@ -379,13 +387,14 @@ class Model:
 
         return kpi
 
-    def xlsx_export(self, excel_output_filename="risultati_dettagliati_microgrid.xlsx"):
+    def xlsx_export(self):
         # ==========================================
         # 3. ESPORTAZIONE IN EXCEL
         # ==========================================
         # excel_output_filename = "risultati_dettagliati_microgrid.xlsx"
-        self.df_res.to_excel(excel_output_filename, index=False)
-        print(f"File Excel dettagliato generato con successo: {excel_output_filename}")
+        filename = f'{self.name}_uc={self.uc}_sim_chg={self.h2v_chg_max_n}_detailed_output.xlsx'
+        self.df_res.to_excel(filename, index=False)
+        print(f"File Excel dettagliato generato con successo: {filename}")
 
     def output_print(self):
         # ==========================================
@@ -416,7 +425,7 @@ class Model:
 
         print("==================================================")
 
-    def graphs(self):
+    def graphs(self, name = ''):
         # ==========================================
         # 5. GENERAZIONE DEI GRAFICI (4 Subplots)
         # ==========================================
@@ -476,9 +485,11 @@ class Model:
 
         plt.xticks(self.df_res['Ora'][::8], rotation=45)
         plt.tight_layout()
-        plt.savefig('microgrid_simulation_results.png', dpi=300)
+
+        filename = f'{name}_uc={self.uc}_sim_chg={self.h2v_chg_max_n}.png'
+        plt.savefig(filename, dpi=300)
         plt.close()
-        print("Grafici generati e salvati in 'microgrid_simulation_results.png'.")
+        print(f"Grafici generati e salvati in '{filename}'.")
 
 
 if __name__ == "__main__":
