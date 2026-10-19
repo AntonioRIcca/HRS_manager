@@ -487,7 +487,7 @@ class Model:
         plt.tight_layout()
 
         filename = f'{name}_uc={self.uc}_sim_chg={self.h2v_chg_max_n}.png'
-        plt.savefig(filename, dpi=300)
+        plt.savefig(filename, dpi=1200)
         plt.close()
         print(f"Grafici generati e salvati in '{filename}'.")
 
